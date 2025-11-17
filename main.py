@@ -27,39 +27,52 @@ GUPSHUP_SOURCE_NUMBER = os.getenv("GUPSHUP_SOURCE_NUMBER")
 # AWS S3 Configuration
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
 # Initialize S3 client
 s3_client = None
 if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION
-    )
+    s3_config = {
+        'aws_access_key_id': AWS_ACCESS_KEY_ID,
+        'aws_secret_access_key': AWS_SECRET_ACCESS_KEY,
+        'region_name': AWS_REGION
+    }
+    # Add session token if provided (for temporary credentials)
+    if AWS_SESSION_TOKEN:
+        s3_config['aws_session_token'] = AWS_SESSION_TOKEN
+
+    s3_client = boto3.client('s3', **s3_config)
 
 
 def get_csv_files_from_s3() -> dict:
-    """Fetch all CSV files from S3 bucket and return as dictionary of DataFrames"""
+    """Fetch all CSV files from S3 bucket recursively (including subdirectories) and return as dictionary of DataFrames"""
     if not s3_client or not S3_BUCKET_NAME:
         return {}
 
     csv_data = {}
     try:
-        response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME)
+        # Use paginator to handle buckets with many files
+        paginator = s3_client.get_paginator('list_objects_v2')
 
-        if 'Contents' not in response:
-            return {}
+        # Iterate through all pages of results (handles subdirectories automatically)
+        for page in paginator.paginate(Bucket=S3_BUCKET_NAME):
+            if 'Contents' not in page:
+                continue
 
-        for obj in response['Contents']:
-            if obj['Key'].endswith('.csv'):
-                file_name = obj['Key']
-                csv_obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_name)
-                csv_content = csv_obj['Body'].read().decode('utf-8')
-                df = pd.read_csv(StringIO(csv_content))
-                csv_data[file_name] = df
+            for obj in page['Contents']:
+                if obj['Key'].endswith('.csv'):
+                    file_name = obj['Key']
+                    try:
+                        csv_obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_name)
+                        csv_content = csv_obj['Body'].read().decode('utf-8')
+                        df = pd.read_csv(StringIO(csv_content))
+                        csv_data[file_name] = df
+                        print(f"Loaded CSV: {file_name} ({len(df)} rows)")
+                    except Exception as e:
+                        print(f"Error loading CSV {file_name}: {e}")
+                        continue
     except ClientError as e:
         print(f"Error fetching CSV files from S3: {e}")
 
@@ -197,6 +210,28 @@ async def gupshup_webhook(request: Request):
     """
     Webhook endpoint for Gupshup WhatsApp messages.
     This endpoint receives incoming WhatsApp messages and responds with data analysis.
+
+    Expected Gupshup payload structure:
+    {
+        "app": "AppName",
+        "timestamp": 1580227766370,
+        "version": 2,
+        "type": "message",
+        "payload": {
+            "id": "message_id",
+            "source": "919876543210",
+            "type": "text",
+            "payload": {
+                "text": "user message here"
+            },
+            "sender": {
+                "phone": "919876543210",
+                "name": "User Name",
+                "country_code": "91",
+                "dial_code": "9876543210"
+            }
+        }
+    }
     """
     try:
         # Parse the incoming request
@@ -205,37 +240,70 @@ async def gupshup_webhook(request: Request):
         if "application/json" in content_type:
             payload = await request.json()
         else:
-            # Gupshup often sends form-urlencoded data
+            # Gupshup may send form-urlencoded data
             form_data = await request.form()
             payload = dict(form_data)
+            # If payload field exists as string, parse it
+            if "payload" in payload and isinstance(payload["payload"], str):
+                try:
+                    payload["payload"] = json.loads(payload["payload"])
+                except json.JSONDecodeError:
+                    pass
 
-        print(f"Received webhook payload: {payload}")
+        print(f"Received webhook payload: {json.dumps(payload, indent=2)}")
 
         # Extract message details from Gupshup payload
-        # Gupshup sends different payload structures, handle common ones
-        message_type = payload.get("type", "")
+        event_type = payload.get("type", "")
+        phone_number = ""
+        user_message = ""
 
-        if message_type == "message":
-            # Standard message event
+        if event_type == "message":
+            # Standard Gupshup message event structure
             message_payload = payload.get("payload", {})
+
+            # Handle case where payload might be a string
             if isinstance(message_payload, str):
-                message_payload = json.loads(message_payload)
+                try:
+                    message_payload = json.loads(message_payload)
+                except json.JSONDecodeError:
+                    message_payload = {}
 
+            # Get phone number from sender object or source field
             sender = message_payload.get("sender", {})
-            phone_number = sender.get("phone", "") if isinstance(sender, dict) else payload.get("mobile", "")
+            if isinstance(sender, dict):
+                phone_number = sender.get("phone", "")
+            if not phone_number:
+                phone_number = message_payload.get("source", "")
 
-            message_content = message_payload.get("payload", {})
-            if isinstance(message_content, dict):
-                user_message = message_content.get("text", "")
+            # Get message content based on message type
+            message_type = message_payload.get("type", "")
+            inner_payload = message_payload.get("payload", {})
+
+            if isinstance(inner_payload, str):
+                try:
+                    inner_payload = json.loads(inner_payload)
+                except json.JSONDecodeError:
+                    inner_payload = {"text": inner_payload}
+
+            if message_type == "text" and isinstance(inner_payload, dict):
+                user_message = inner_payload.get("text", "")
+            elif isinstance(inner_payload, dict):
+                # Handle other message types (image, audio, etc.)
+                user_message = inner_payload.get("text", inner_payload.get("caption", ""))
             else:
-                user_message = str(message_content)
+                user_message = str(inner_payload)
+
+        elif event_type == "message-event":
+            # This is a delivery/read receipt, not a user message
+            print("Received message event (delivery/read receipt), ignoring")
+            return JSONResponse(content={"status": "ok", "message": "Event acknowledged"})
         else:
-            # Try alternative payload structure
-            phone_number = payload.get("mobile", payload.get("sender", ""))
+            # Try alternative/legacy payload structure
+            phone_number = payload.get("mobile", payload.get("sender", payload.get("source", "")))
             user_message = payload.get("text", payload.get("message", ""))
 
         if not phone_number or not user_message:
-            print(f"Could not extract phone number or message from payload: {payload}")
+            print(f"Could not extract phone number or message from payload")
             return JSONResponse(content={"status": "ok", "message": "No message to process"})
 
         print(f"Processing message from {phone_number}: {user_message}")

@@ -5,7 +5,7 @@ A WhatsApp bot webhook that uses Google Gemini (via OpenRouter) to analyze CSV d
 ## Features
 
 - **Gupshup WhatsApp Integration**: Receives and responds to WhatsApp messages
-- **AWS S3 Data Storage**: Fetches CSV files from your S3 bucket
+- **AWS S3 Data Storage**: Recursively fetches CSV files from your S3 bucket (including all subdirectories)
 - **Google Gemini AI**: Uses Gemini 2.0 Flash for intelligent data analysis
 - **FastAPI Backend**: High-performance async API
 - **Railway Deployment Ready**: Pre-configured for Railway deployment
@@ -46,6 +46,7 @@ Required environment variables:
 - `GUPSHUP_SOURCE_NUMBER`: Your WhatsApp business number
 - `AWS_ACCESS_KEY_ID`: AWS access key
 - `AWS_SECRET_ACCESS_KEY`: AWS secret key
+- `AWS_SESSION_TOKEN`: AWS session token (for temporary credentials)
 - `S3_BUCKET_NAME`: Your S3 bucket containing CSV files
 
 ### 4. Run locally
@@ -96,9 +97,26 @@ https://your-railway-app.up.railway.app/webhook/gupshup
 ## S3 Data Format
 
 Place your CSV files in your S3 bucket. The bot will automatically:
-1. List all CSV files in the bucket
-2. Load them into memory
+1. Recursively scan all subdirectories in the bucket
+2. Load all CSV files into memory (with their full path as identifier)
 3. Provide data context to Gemini for analysis
+
+### Folder Structure Support
+
+The bot supports nested folder structures in S3:
+```
+your-bucket/
+├── sales/
+│   ├── monthly_sales.csv
+│   └── yearly_sales.csv
+├── inventory/
+│   ├── stock_levels.csv
+│   └── reorder_points.csv
+└── customers/
+    └── customer_data.csv
+```
+
+All CSV files will be discovered and loaded automatically.
 
 ### Tips for Best Results
 
@@ -106,6 +124,7 @@ Place your CSV files in your S3 bucket. The bot will automatically:
 - Include headers in all CSV files
 - Keep data clean and well-formatted
 - Organize related data in separate CSV files
+- Use meaningful folder/file names as they appear in the data context
 
 ## Example Use Cases
 
