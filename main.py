@@ -128,7 +128,7 @@ Please analyze the data and provide a helpful response to the user's query. Form
     }
 
     payload = {
-        "model": "google/gemini-2.0-flash-exp:free",
+        "model": "google/gemini-flash-1.5-exp",
         "messages": messages,
         "max_tokens": 1000,
         "temperature": 0.7
