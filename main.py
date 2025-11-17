@@ -20,6 +20,7 @@ app = FastAPI(
 # Configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Direct Google Gemini API key
 GUPSHUP_API_KEY = os.getenv("GUPSHUP_API_KEY")
 GUPSHUP_APP_NAME = os.getenv("GUPSHUP_APP_NAME")
 GUPSHUP_SOURCE_NUMBER = os.getenv("GUPSHUP_SOURCE_NUMBER")
@@ -94,10 +95,81 @@ def get_data_summary(csv_data: dict) -> str:
     return summary
 
 
-async def query_gemini(user_message: str, data_context: str) -> str:
+async def query_gemini_direct(user_message: str, data_context: str) -> str:
+    """Query Google Gemini directly using Google's API"""
+    if not GOOGLE_API_KEY:
+        return None
+
+    system_prompt = """You are a data analysis assistant for a WhatsApp bot. Your role is to:
+1. Analyze data from CSV files stored in AWS S3
+2. Answer user queries about the data
+3. Provide insights and analysis based on the available data
+4. Format responses in a clear, concise manner suitable for WhatsApp messages
+
+Keep responses brief and mobile-friendly. Use bullet points and short paragraphs.
+If asked for specific data, provide exact numbers and relevant statistics.
+If the data doesn't contain information to answer the query, clearly state that."""
+
+    full_prompt = f"""{system_prompt}
+
+Here is the available data context:
+
+{data_context}
+
+User Query: {user_message}
+
+Please analyze the data and provide a helpful response to the user's query. Format your response for WhatsApp (keep it concise and easy to read on mobile)."""
+
+    # Google Gemini API endpoint
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": full_prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 1000,
+        }
+    }
+
+    print(f"Calling Google Gemini API directly...")
+    print(f"API Key (first 8 chars): {GOOGLE_API_KEY[:8]}...")
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, json=payload)
+
+            print(f"Google Gemini response status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"Google Gemini response body: {response.text}")
+
+            response.raise_for_status()
+            result = response.json()
+
+            # Extract text from Gemini response
+            if "candidates" in result and len(result["candidates"]) > 0:
+                candidate = result["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    parts = candidate["content"]["parts"]
+                    if len(parts) > 0 and "text" in parts[0]:
+                        return parts[0]["text"]
+
+            print(f"Unexpected Gemini response structure: {result}")
+            return None
+    except Exception as e:
+        print(f"Error querying Google Gemini directly: {e}")
+        return None
+
+
+async def query_gemini_openrouter(user_message: str, data_context: str) -> str:
     """Query Google Gemini via OpenRouter API"""
     if not OPENROUTER_API_KEY:
-        return "OpenRouter API key not configured. Please set OPENROUTER_API_KEY environment variable."
+        return None
 
     system_prompt = """You are a data analysis assistant for a WhatsApp bot. Your role is to:
 1. Analyze data from CSV files stored in AWS S3
@@ -145,7 +217,6 @@ Please analyze the data and provide a helpful response to the user's query. Form
                 json=payload
             )
 
-            # Log response for debugging
             print(f"OpenRouter response status: {response.status_code}")
             if response.status_code != 200:
                 print(f"OpenRouter response body: {response.text}")
@@ -153,13 +224,35 @@ Please analyze the data and provide a helpful response to the user's query. Form
             response.raise_for_status()
             result = response.json()
             return result['choices'][0]['message']['content']
-    except httpx.HTTPStatusError as e:
-        print(f"HTTP error from OpenRouter: {e}")
-        print(f"Response body: {e.response.text}")
-        return "Sorry, I encountered an error while processing your request. Please try again later."
     except Exception as e:
-        print(f"Error querying Gemini: {e}")
-        return "Sorry, I encountered an unexpected error. Please try again later."
+        print(f"Error querying OpenRouter: {e}")
+        return None
+
+
+async def query_gemini(user_message: str, data_context: str) -> str:
+    """Query Google Gemini with fallback: OpenRouter first, then direct Google API"""
+
+    # Try OpenRouter first
+    if OPENROUTER_API_KEY:
+        print("Attempting OpenRouter API...")
+        result = await query_gemini_openrouter(user_message, data_context)
+        if result:
+            return result
+        print("OpenRouter failed, trying direct Google Gemini API...")
+
+    # Fallback to direct Google Gemini API
+    if GOOGLE_API_KEY:
+        print("Attempting direct Google Gemini API...")
+        result = await query_gemini_direct(user_message, data_context)
+        if result:
+            return result
+        print("Direct Google Gemini API also failed.")
+
+    # Both failed
+    if not OPENROUTER_API_KEY and not GOOGLE_API_KEY:
+        return "No LLM API configured. Please set either OPENROUTER_API_KEY or GOOGLE_API_KEY environment variable."
+
+    return "Sorry, I encountered an error while processing your request. Please try again later."
 
 
 async def send_whatsapp_message(phone_number: str, message: str):
@@ -228,6 +321,8 @@ async def health_check():
         "status": "healthy",
         "s3_configured": s3_client is not None,
         "openrouter_configured": OPENROUTER_API_KEY is not None,
+        "google_api_configured": GOOGLE_API_KEY is not None,
+        "llm_available": OPENROUTER_API_KEY is not None or GOOGLE_API_KEY is not None,
         "gupshup_configured": all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER])
     }
 
