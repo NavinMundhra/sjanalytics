@@ -3,6 +3,7 @@ import json
 import httpx
 import pandas as pd
 from io import StringIO
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import boto3
@@ -14,15 +15,15 @@ load_dotenv()
 app = FastAPI(
     title="SJ Analytics WhatsApp Bot",
     description="WhatsApp bot for data analysis using Gupshup and Google Gemini",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # Configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")  # Default to current model
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Direct Google Gemini API key
-GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash")  # Default model for direct API (1.5 is retired)
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")  # Default to GPT-4o-mini for accuracy
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Direct Google Gemini API key (fallback)
+GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash")  # Default model for direct API
 GUPSHUP_API_KEY = os.getenv("GUPSHUP_API_KEY")
 GUPSHUP_APP_NAME = os.getenv("GUPSHUP_APP_NAME")
 GUPSHUP_SOURCE_NUMBER = os.getenv("GUPSHUP_SOURCE_NUMBER")
@@ -33,6 +34,9 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+# Data source configuration - only use specific CSV file for now
+PRIMARY_DATA_FILE = os.getenv("PRIMARY_DATA_FILE", "monthly_master/master.csv")
 
 # Initialize S3 client
 s3_client = None
@@ -48,153 +52,173 @@ if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
 
     s3_client = boto3.client('s3', **s3_config)
 
-
-def get_csv_files_from_s3() -> dict:
-    """Fetch all CSV files from S3 bucket recursively (including subdirectories) and return as dictionary of DataFrames"""
-    if not s3_client or not S3_BUCKET_NAME:
-        return {}
-
-    csv_data = {}
-    try:
-        # Use paginator to handle buckets with many files
-        paginator = s3_client.get_paginator('list_objects_v2')
-
-        # Iterate through all pages of results (handles subdirectories automatically)
-        for page in paginator.paginate(Bucket=S3_BUCKET_NAME):
-            if 'Contents' not in page:
-                continue
-
-            for obj in page['Contents']:
-                if obj['Key'].endswith('.csv'):
-                    file_name = obj['Key']
-                    try:
-                        csv_obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_name)
-                        csv_content = csv_obj['Body'].read().decode('utf-8')
-                        df = pd.read_csv(StringIO(csv_content))
-                        csv_data[file_name] = df
-                        print(f"Loaded CSV: {file_name} ({len(df)} rows)")
-                    except Exception as e:
-                        print(f"Error loading CSV {file_name}: {e}")
-                        continue
-    except ClientError as e:
-        print(f"Error fetching CSV files from S3: {e}")
-
-    return csv_data
+# In-memory cache for CSV data to avoid repeated S3 calls
+_csv_cache = {}
+_cache_timestamp = None
+CACHE_TTL_SECONDS = 300  # 5 minutes cache
 
 
-def get_data_summary(csv_data: dict) -> str:
-    """Generate a summary of available data for the LLM context"""
-    if not csv_data:
-        return "No data files available."
-
-    summary = "Available datasets:\n\n"
-    for file_name, df in csv_data.items():
-        summary += f"File: {file_name}\n"
-        summary += f"Columns: {', '.join(df.columns.tolist())}\n"
-        summary += f"Rows: {len(df)}\n"
-        # Show first 5 rows for better context
-        summary += f"Sample data (first 5 rows):\n{df.head(5).to_string()}\n\n"
-        # Add column data types for better analysis
-        summary += f"Column types: {df.dtypes.to_string()}\n\n"
-
-    return summary
-
-
-async def query_gemini_direct(user_message: str, data_context: str) -> str:
-    """Query Google Gemini directly using Google's API"""
-    if not GOOGLE_API_KEY:
-        return None
-
-    system_prompt = """You are a data analysis assistant for a WhatsApp bot. Your role is to:
-1. Analyze data from CSV files stored in AWS S3
-2. Answer user queries about the data
-3. Provide insights and analysis based on the available data
-4. Format responses in a clear, concise manner suitable for WhatsApp messages
-
-Keep responses brief and mobile-friendly. Use bullet points and short paragraphs.
-If asked for specific data, provide exact numbers and relevant statistics.
-If the data doesn't contain information to answer the query, clearly state that."""
-
-    full_prompt = f"""{system_prompt}
-
-Here is the available data context:
-
-{data_context}
-
-User Query: {user_message}
-
-Please analyze the data and provide a helpful response to the user's query. Format your response for WhatsApp (keep it concise and easy to read on mobile)."""
-
-    # Google Gemini API endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GOOGLE_MODEL}:generateContent?key={GOOGLE_API_KEY}"
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": full_prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 1000,
+def log_interaction(
+    user_phone: str,
+    user_name: str,
+    user_query: str,
+    llm_provider: str,
+    llm_model: str,
+    llm_response: str,
+    data_files_used: list,
+    response_time_ms: float,
+    success: bool,
+    error_message: str = None
+):
+    """Log interaction details for monitoring and analytics"""
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "event_type": "user_interaction",
+        "user": {
+            "phone": user_phone,
+            "name": user_name,
+            "country_code": user_phone[:2] if len(user_phone) > 2 else ""
+        },
+        "query": {
+            "text": user_query,
+            "length": len(user_query)
+        },
+        "llm": {
+            "provider": llm_provider,
+            "model": llm_model,
+            "response_length": len(llm_response) if llm_response else 0
+        },
+        "data": {
+            "files_used": data_files_used,
+            "total_files": len(data_files_used)
+        },
+        "performance": {
+            "response_time_ms": round(response_time_ms, 2)
+        },
+        "status": {
+            "success": success,
+            "error": error_message
+        },
+        "bot": {
+            "name": GUPSHUP_APP_NAME or "sjanalytics",
+            "version": "2.0.0"
         }
     }
 
-    print(f"Calling Google Gemini API directly with model: {GOOGLE_MODEL}")
-    print(f"API Key (first 8 chars): {GOOGLE_API_KEY[:8]}...")
+    # Print as structured JSON log for easy parsing by log aggregators
+    print(f"MONITORING_LOG: {json.dumps(log_entry)}")
+    return log_entry
+
+
+def get_master_csv_from_s3() -> tuple[pd.DataFrame, str]:
+    """
+    Fetch only the primary master CSV file from S3.
+    Returns tuple of (DataFrame, filename) or (None, None) if not found.
+    Uses caching to avoid repeated S3 calls.
+    """
+    global _csv_cache, _cache_timestamp
+
+    if not s3_client or not S3_BUCKET_NAME:
+        return None, None
+
+    # Check cache validity
+    current_time = datetime.utcnow()
+    if _cache_timestamp and (current_time - _cache_timestamp).total_seconds() < CACHE_TTL_SECONDS:
+        if PRIMARY_DATA_FILE in _csv_cache:
+            print(f"Using cached data for {PRIMARY_DATA_FILE}")
+            return _csv_cache[PRIMARY_DATA_FILE], PRIMARY_DATA_FILE
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, json=payload)
+        print(f"Fetching {PRIMARY_DATA_FILE} from S3...")
+        csv_obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=PRIMARY_DATA_FILE)
+        csv_content = csv_obj['Body'].read().decode('utf-8')
+        df = pd.read_csv(StringIO(csv_content))
 
-            print(f"Google Gemini response status: {response.status_code}")
-            if response.status_code != 200:
-                print(f"Google Gemini response body: {response.text}")
+        # Update cache
+        _csv_cache[PRIMARY_DATA_FILE] = df
+        _cache_timestamp = current_time
 
-            response.raise_for_status()
-            result = response.json()
-
-            # Extract text from Gemini response
-            if "candidates" in result and len(result["candidates"]) > 0:
-                candidate = result["candidates"][0]
-                if "content" in candidate and "parts" in candidate["content"]:
-                    parts = candidate["content"]["parts"]
-                    if len(parts) > 0 and "text" in parts[0]:
-                        return parts[0]["text"]
-
-            print(f"Unexpected Gemini response structure: {result}")
-            return None
+        print(f"Loaded CSV: {PRIMARY_DATA_FILE} ({len(df)} rows, {len(df.columns)} columns)")
+        return df, PRIMARY_DATA_FILE
+    except ClientError as e:
+        print(f"Error fetching {PRIMARY_DATA_FILE} from S3: {e}")
+        return None, None
     except Exception as e:
-        print(f"Error querying Google Gemini directly: {e}")
-        return None
+        print(f"Error loading CSV {PRIMARY_DATA_FILE}: {e}")
+        return None, None
 
 
-async def query_gemini_openrouter(user_message: str, data_context: str) -> str:
-    """Query Google Gemini via OpenRouter API"""
+def prepare_data_context(df: pd.DataFrame, filename: str) -> str:
+    """
+    Prepare comprehensive data context for the LLM.
+    Provides COMPLETE data to avoid hallucinations.
+    """
+    if df is None or df.empty:
+        return "No data available."
+
+    context = f"""=== DATA SOURCE: {filename} ===
+
+SCHEMA:
+- Total Rows: {len(df)}
+- Columns: {', '.join(df.columns.tolist())}
+
+COLUMN DETAILS:
+{df.dtypes.to_string()}
+
+COMPLETE DATA (ALL {len(df)} ROWS):
+{df.to_string()}
+
+=== END OF DATA ===
+"""
+    return context
+
+
+def get_deterministic_system_prompt() -> str:
+    """
+    System prompt designed for accurate, deterministic responses with zero hallucination.
+    """
+    return """You are a precise data analysis assistant. Your responses MUST be:
+
+1. **STRICTLY DATA-DRIVEN**: Only use information that EXISTS in the provided data. Never make up numbers.
+
+2. **EXACT MATCHING**: When asked about a specific month/period (e.g., "March 2025"), look for EXACT matches in the data.
+
+3. **TRANSPARENT ABOUT LIMITATIONS**: If data doesn't exist or doesn't match the query, clearly state:
+   - "The data does not contain information for [specific query]"
+   - "Available periods in the data are: [list actual periods]"
+
+4. **CALCULATION RULES**:
+   - Show the exact values from the data
+   - If aggregating, list which rows you're summing
+   - Format numbers clearly (e.g., ₹1,23,456 or 1.23 lakhs)
+
+5. **RESPONSE FORMAT** (for WhatsApp):
+   - Keep responses concise but complete
+   - Use bullet points for clarity
+   - Include the source row/column when citing specific values
+
+CRITICAL: If you cannot find the exact data requested, DO NOT guess or approximate. State clearly what data IS available."""
+
+
+async def query_openrouter(user_message: str, data_context: str) -> tuple[str, str]:
+    """
+    Query LLM via OpenRouter API (primary provider).
+    Returns tuple of (response_text, model_used) or (None, None) on failure.
+    """
     if not OPENROUTER_API_KEY:
-        return None
+        return None, None
 
-    system_prompt = """You are a data analysis assistant for a WhatsApp bot. Your role is to:
-1. Analyze data from CSV files stored in AWS S3
-2. Answer user queries about the data
-3. Provide insights and analysis based on the available data
-4. Format responses in a clear, concise manner suitable for WhatsApp messages
-
-Keep responses brief and mobile-friendly. Use bullet points and short paragraphs.
-If asked for specific data, provide exact numbers and relevant statistics.
-If the data doesn't contain information to answer the query, clearly state that."""
+    system_prompt = get_deterministic_system_prompt()
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"""Here is the available data context:
+        {"role": "user", "content": f"""Analyze the following data to answer the user's question.
 
 {data_context}
 
-User Query: {user_message}
+USER QUESTION: {user_message}
 
-Please analyze the data and provide a helpful response to the user's query. Format your response for WhatsApp (keep it concise and easy to read on mobile)."""}
+Provide an accurate, data-driven response based ONLY on the data above. If the specific information requested is not in the data, clearly state what IS available."""}
     ]
 
     headers = {
@@ -207,12 +231,11 @@ Please analyze the data and provide a helpful response to the user's query. Form
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
-        "max_tokens": 1000,
-        "temperature": 0.7
+        "max_tokens": 2000,
+        "temperature": 0.1  # Low temperature for more deterministic responses
     }
 
     print(f"Calling OpenRouter API with model: {OPENROUTER_MODEL}")
-    print(f"API Key (first 8 chars): {OPENROUTER_API_KEY[:8]}...")
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -225,48 +248,113 @@ Please analyze the data and provide a helpful response to the user's query. Form
             print(f"OpenRouter response status: {response.status_code}")
             if response.status_code != 200:
                 print(f"OpenRouter response body: {response.text}")
+                return None, None
 
             response.raise_for_status()
             result = response.json()
-            return result['choices'][0]['message']['content']
+            return result['choices'][0]['message']['content'], OPENROUTER_MODEL
     except Exception as e:
         print(f"Error querying OpenRouter: {e}")
-        return None
+        return None, None
 
 
-async def query_gemini(user_message: str, data_context: str) -> str:
-    """Query Google Gemini with fallback: Direct Google API first (more reliable), then OpenRouter"""
+async def query_gemini_direct(user_message: str, data_context: str) -> tuple[str, str]:
+    """
+    Query Google Gemini directly (fallback provider).
+    Returns tuple of (response_text, model_used) or (None, None) on failure.
+    """
+    if not GOOGLE_API_KEY:
+        return None, None
 
-    # Try direct Google Gemini API first (more reliable)
-    if GOOGLE_API_KEY:
-        print("Attempting direct Google Gemini API...")
-        result = await query_gemini_direct(user_message, data_context)
-        if result:
-            return result
-        print("Direct Google Gemini API failed, trying OpenRouter...")
+    system_prompt = get_deterministic_system_prompt()
 
-    # Fallback to OpenRouter
+    full_prompt = f"""{system_prompt}
+
+Analyze the following data to answer the user's question.
+
+{data_context}
+
+USER QUESTION: {user_message}
+
+Provide an accurate, data-driven response based ONLY on the data above. If the specific information requested is not in the data, clearly state what IS available."""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GOOGLE_MODEL}:generateContent?key={GOOGLE_API_KEY}"
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": full_prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,  # Low temperature for deterministic responses
+            "maxOutputTokens": 2000,
+        }
+    }
+
+    print(f"Calling Google Gemini API with model: {GOOGLE_MODEL}")
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, json=payload)
+
+            print(f"Google Gemini response status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"Google Gemini response body: {response.text}")
+                return None, None
+
+            response.raise_for_status()
+            result = response.json()
+
+            if "candidates" in result and len(result["candidates"]) > 0:
+                candidate = result["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    parts = candidate["content"]["parts"]
+                    if len(parts) > 0 and "text" in parts[0]:
+                        return parts[0]["text"], GOOGLE_MODEL
+
+            print(f"Unexpected Gemini response structure: {result}")
+            return None, None
+    except Exception as e:
+        print(f"Error querying Google Gemini directly: {e}")
+        return None, None
+
+
+async def query_llm(user_message: str, data_context: str) -> tuple[str, str, str]:
+    """
+    Query LLM with fallback: OpenRouter (GPT-4o-mini) first, then Google Gemini.
+    Returns tuple of (response_text, provider_name, model_name).
+    """
+
+    # Try OpenRouter first (GPT-4o-mini is more accurate for data analysis)
     if OPENROUTER_API_KEY:
-        print("Attempting OpenRouter API...")
-        result = await query_gemini_openrouter(user_message, data_context)
+        print("Attempting OpenRouter API (primary)...")
+        result, model = await query_openrouter(user_message, data_context)
         if result:
-            return result
-        print("OpenRouter also failed.")
+            return result, "OpenRouter", model
+        print("OpenRouter failed, trying Google Gemini as fallback...")
+
+    # Fallback to direct Google Gemini API
+    if GOOGLE_API_KEY:
+        print("Attempting Google Gemini API (fallback)...")
+        result, model = await query_gemini_direct(user_message, data_context)
+        if result:
+            return result, "Google", model
+        print("Google Gemini also failed.")
 
     # Both failed
     if not OPENROUTER_API_KEY and not GOOGLE_API_KEY:
-        return "No LLM API configured. Please set either OPENROUTER_API_KEY or GOOGLE_API_KEY environment variable."
+        return "No LLM API configured. Please set either OPENROUTER_API_KEY or GOOGLE_API_KEY.", "None", "None"
 
-    return "Sorry, I encountered an error while processing your request. Please try again later."
+    return "Sorry, I encountered an error while processing your request. Please try again later.", "Error", "None"
 
 
 async def send_whatsapp_message(phone_number: str, message: str):
     """Send WhatsApp message via Gupshup API"""
     if not all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER]):
         print("Gupshup configuration incomplete")
-        print(f"  API Key set: {bool(GUPSHUP_API_KEY)}")
-        print(f"  App Name: {GUPSHUP_APP_NAME}")
-        print(f"  Source Number: {GUPSHUP_SOURCE_NUMBER}")
         return False
 
     url = "https://api.gupshup.io/wa/api/v1/msg"
@@ -277,7 +365,6 @@ async def send_whatsapp_message(phone_number: str, message: str):
         "Cache-Control": "no-cache"
     }
 
-    # Ensure phone number is in correct format (no + sign, just digits)
     clean_phone = phone_number.replace("+", "").replace(" ", "").replace("-", "")
     clean_source = GUPSHUP_SOURCE_NUMBER.replace("+", "").replace(" ", "").replace("-", "")
 
@@ -289,20 +376,11 @@ async def send_whatsapp_message(phone_number: str, message: str):
         "src.name": GUPSHUP_APP_NAME
     }
 
-    print(f"Sending message to {clean_phone} from {clean_source}")
-    print(f"App name: {GUPSHUP_APP_NAME}")
-    print(f"API Key (first 8 chars): {GUPSHUP_API_KEY[:8]}...")
-
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, headers=headers, data=data)
-
-            # Log response details for debugging
-            print(f"Response status: {response.status_code}")
-            print(f"Response body: {response.text}")
-
+            print(f"Gupshup response status: {response.status_code}")
             response.raise_for_status()
-            print(f"Message sent successfully to {clean_phone}")
             return True
     except Exception as e:
         print(f"Error sending WhatsApp message: {e}")
@@ -315,7 +393,7 @@ async def root():
     return {
         "status": "healthy",
         "service": "SJ Analytics WhatsApp Bot",
-        "version": "1.0.0"
+        "version": "2.0.0"
     }
 
 
@@ -327,94 +405,63 @@ async def health_check():
         "s3_configured": s3_client is not None,
         "openrouter_configured": OPENROUTER_API_KEY is not None,
         "google_api_configured": GOOGLE_API_KEY is not None,
-        "llm_available": OPENROUTER_API_KEY is not None or GOOGLE_API_KEY is not None,
+        "primary_llm": "OpenRouter" if OPENROUTER_API_KEY else ("Google" if GOOGLE_API_KEY else "None"),
+        "primary_model": OPENROUTER_MODEL if OPENROUTER_API_KEY else GOOGLE_MODEL,
+        "primary_data_file": PRIMARY_DATA_FILE,
         "gupshup_configured": all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER])
-    }
-
-
-@app.get("/debug/gupshup")
-async def debug_gupshup():
-    """
-    Debug endpoint to verify Gupshup configuration.
-    Shows configuration details (without exposing full API key).
-    """
-    api_key_info = "Not set"
-    if GUPSHUP_API_KEY:
-        api_key_info = f"{GUPSHUP_API_KEY[:8]}...{GUPSHUP_API_KEY[-4:]}" if len(GUPSHUP_API_KEY) > 12 else "Set but too short"
-
-    return {
-        "gupshup_api_key": api_key_info,
-        "gupshup_app_name": GUPSHUP_APP_NAME or "Not set",
-        "gupshup_source_number": GUPSHUP_SOURCE_NUMBER or "Not set",
-        "all_configured": all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER]),
-        "note": "If you're getting 401 errors, verify: 1) API key is correct from Gupshup dashboard, 2) App name matches exactly, 3) Source number is your sandbox/WhatsApp Business number"
     }
 
 
 @app.get("/debug/llm")
 async def debug_llm():
-    """
-    Debug endpoint to verify LLM configuration.
-    Shows which models are configured and their current settings.
-    """
-    google_key_info = "Not set"
-    if GOOGLE_API_KEY:
-        google_key_info = f"{GOOGLE_API_KEY[:8]}...{GOOGLE_API_KEY[-4:]}" if len(GOOGLE_API_KEY) > 12 else "Set but too short"
-
-    openrouter_key_info = "Not set"
-    if OPENROUTER_API_KEY:
-        openrouter_key_info = f"{OPENROUTER_API_KEY[:8]}...{OPENROUTER_API_KEY[-4:]}" if len(OPENROUTER_API_KEY) > 12 else "Set but too short"
-
+    """Debug endpoint to verify LLM configuration"""
     return {
-        "google_api_key": google_key_info,
-        "google_model": GOOGLE_MODEL,
-        "openrouter_api_key": openrouter_key_info,
+        "openrouter_configured": OPENROUTER_API_KEY is not None,
         "openrouter_model": OPENROUTER_MODEL,
-        "primary_provider": "Google Direct API" if GOOGLE_API_KEY else ("OpenRouter" if OPENROUTER_API_KEY else "None"),
-        "fallback_provider": "OpenRouter" if (GOOGLE_API_KEY and OPENROUTER_API_KEY) else "None",
-        "note": "Direct Google API is tried first (more reliable). Set GOOGLE_API_KEY from https://aistudio.google.com/app/apikey"
+        "google_configured": GOOGLE_API_KEY is not None,
+        "google_model": GOOGLE_MODEL,
+        "primary_provider": "OpenRouter (GPT-4o-mini)" if OPENROUTER_API_KEY else "Google Gemini",
+        "fallback_provider": "Google Gemini" if (OPENROUTER_API_KEY and GOOGLE_API_KEY) else "None",
+        "temperature": 0.1,
+        "note": "Using low temperature (0.1) for deterministic responses. OpenRouter/GPT-4o-mini is primary for better accuracy."
     }
+
+
+@app.get("/debug/data")
+async def debug_data():
+    """Debug endpoint to check data loading"""
+    df, filename = get_master_csv_from_s3()
+    if df is not None:
+        return {
+            "status": "success",
+            "file": filename,
+            "rows": len(df),
+            "columns": df.columns.tolist(),
+            "sample_data": df.head(3).to_dict(orient='records'),
+            "cached": _cache_timestamp is not None
+        }
+    else:
+        return {
+            "status": "error",
+            "message": f"Could not load {PRIMARY_DATA_FILE}",
+            "s3_configured": s3_client is not None,
+            "bucket": S3_BUCKET_NAME
+        }
 
 
 @app.post("/webhook/gupshup")
 async def gupshup_webhook(request: Request):
-    """
-    Webhook endpoint for Gupshup WhatsApp messages.
-    This endpoint receives incoming WhatsApp messages and responds with data analysis.
+    """Webhook endpoint for Gupshup WhatsApp messages"""
+    start_time = datetime.utcnow()
 
-    Expected Gupshup payload structure:
-    {
-        "app": "AppName",
-        "timestamp": 1580227766370,
-        "version": 2,
-        "type": "message",
-        "payload": {
-            "id": "message_id",
-            "source": "919876543210",
-            "type": "text",
-            "payload": {
-                "text": "user message here"
-            },
-            "sender": {
-                "phone": "919876543210",
-                "name": "User Name",
-                "country_code": "91",
-                "dial_code": "9876543210"
-            }
-        }
-    }
-    """
     try:
-        # Parse the incoming request
         content_type = request.headers.get("content-type", "")
 
         if "application/json" in content_type:
             payload = await request.json()
         else:
-            # Gupshup may send form-urlencoded data
             form_data = await request.form()
             payload = dict(form_data)
-            # If payload field exists as string, parse it
             if "payload" in payload and isinstance(payload["payload"], str):
                 try:
                     payload["payload"] = json.loads(payload["payload"])
@@ -423,30 +470,26 @@ async def gupshup_webhook(request: Request):
 
         print(f"Received webhook payload: {json.dumps(payload, indent=2)}")
 
-        # Extract message details from Gupshup payload
         event_type = payload.get("type", "")
         phone_number = ""
         user_message = ""
+        user_name = "Unknown"
 
         if event_type == "message":
-            # Standard Gupshup message event structure
             message_payload = payload.get("payload", {})
-
-            # Handle case where payload might be a string
             if isinstance(message_payload, str):
                 try:
                     message_payload = json.loads(message_payload)
                 except json.JSONDecodeError:
                     message_payload = {}
 
-            # Get phone number from sender object or source field
             sender = message_payload.get("sender", {})
             if isinstance(sender, dict):
                 phone_number = sender.get("phone", "")
+                user_name = sender.get("name", "Unknown")
             if not phone_number:
                 phone_number = message_payload.get("source", "")
 
-            # Get message content based on message type
             message_type = message_payload.get("type", "")
             inner_payload = message_payload.get("payload", {})
 
@@ -459,17 +502,14 @@ async def gupshup_webhook(request: Request):
             if message_type == "text" and isinstance(inner_payload, dict):
                 user_message = inner_payload.get("text", "")
             elif isinstance(inner_payload, dict):
-                # Handle other message types (image, audio, etc.)
                 user_message = inner_payload.get("text", inner_payload.get("caption", ""))
             else:
                 user_message = str(inner_payload)
 
         elif event_type == "message-event":
-            # This is a delivery/read receipt, not a user message
             print("Received message event (delivery/read receipt), ignoring")
             return JSONResponse(content={"status": "ok", "message": "Event acknowledged"})
         else:
-            # Try alternative/legacy payload structure
             phone_number = payload.get("mobile", payload.get("sender", payload.get("source", "")))
             user_message = payload.get("text", payload.get("message", ""))
 
@@ -477,51 +517,98 @@ async def gupshup_webhook(request: Request):
             print(f"Could not extract phone number or message from payload")
             return JSONResponse(content={"status": "ok", "message": "No message to process"})
 
-        print(f"Processing message from {phone_number}: {user_message}")
+        print(f"Processing message from {phone_number} ({user_name}): {user_message}")
 
-        # Fetch data from S3
-        csv_data = get_csv_files_from_s3()
-        data_summary = get_data_summary(csv_data)
+        # Load only the master CSV file
+        df, filename = get_master_csv_from_s3()
 
-        # Log data context info
-        print(f"Number of CSV files loaded: {len(csv_data)}")
-        print(f"Data summary length: {len(data_summary)} characters")
-        if len(data_summary) > 500:
-            print(f"Data summary preview (first 500 chars): {data_summary[:500]}...")
-        else:
-            print(f"Data summary: {data_summary}")
+        if df is None:
+            error_msg = f"Unable to load data file {PRIMARY_DATA_FILE}. Please contact support."
+            await send_whatsapp_message(phone_number, error_msg)
 
-        # Query Gemini for analysis
-        response_message = await query_gemini(user_message, data_summary)
+            # Log the failed interaction
+            response_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+            log_interaction(
+                user_phone=phone_number,
+                user_name=user_name,
+                user_query=user_message,
+                llm_provider="None",
+                llm_model="None",
+                llm_response=error_msg,
+                data_files_used=[],
+                response_time_ms=response_time,
+                success=False,
+                error_message="Failed to load data from S3"
+            )
 
-        # Log LLM response
-        print(f"LLM Response length: {len(response_message)} characters")
-        print(f"LLM Response: {response_message[:500]}..." if len(response_message) > 500 else f"LLM Response: {response_message}")
+            return JSONResponse(content={"status": "error", "message": "Data load failed"})
+
+        # Prepare comprehensive data context
+        data_context = prepare_data_context(df, filename)
+
+        print(f"Data context prepared: {len(data_context)} characters")
+
+        # Query LLM for analysis
+        response_message, provider, model = await query_llm(user_message, data_context)
+
+        print(f"LLM Response ({provider}/{model}): {response_message[:200]}...")
 
         # Send response back via WhatsApp
-        await send_whatsapp_message(phone_number, response_message)
+        send_success = await send_whatsapp_message(phone_number, response_message)
+
+        # Calculate response time and log interaction
+        response_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+
+        log_interaction(
+            user_phone=phone_number,
+            user_name=user_name,
+            user_query=user_message,
+            llm_provider=provider,
+            llm_model=model,
+            llm_response=response_message,
+            data_files_used=[filename] if filename else [],
+            response_time_ms=response_time,
+            success=send_success and provider != "Error",
+            error_message=None if send_success else "Failed to send WhatsApp message"
+        )
 
         return JSONResponse(content={
             "status": "success",
-            "message": "Response sent successfully"
+            "message": "Response sent successfully",
+            "provider": provider,
+            "model": model,
+            "response_time_ms": round(response_time, 2)
         })
 
     except Exception as e:
         print(f"Error processing webhook: {e}")
         import traceback
         traceback.print_exc()
+
+        # Log error
+        response_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+        log_interaction(
+            user_phone=phone_number if phone_number else "unknown",
+            user_name=user_name if 'user_name' in dir() else "unknown",
+            user_query=user_message if 'user_message' in dir() else "unknown",
+            llm_provider="Error",
+            llm_model="None",
+            llm_response="",
+            data_files_used=[],
+            response_time_ms=response_time,
+            success=False,
+            error_message=str(e)
+        )
+
         return JSONResponse(
             content={"status": "error", "message": str(e)},
-            status_code=200  # Return 200 to prevent Gupshup from retrying
+            status_code=200
         )
 
 
 @app.post("/test/analyze")
 async def test_analyze(request: Request):
-    """
-    Test endpoint to analyze data without WhatsApp integration.
-    Send a JSON body with {"query": "your question about the data"}
-    """
+    """Test endpoint for data analysis without WhatsApp"""
     try:
         body = await request.json()
         user_query = body.get("query", "")
@@ -529,20 +616,105 @@ async def test_analyze(request: Request):
         if not user_query:
             raise HTTPException(status_code=400, detail="Query is required")
 
-        # Fetch data from S3
-        csv_data = get_csv_files_from_s3()
-        data_summary = get_data_summary(csv_data)
+        df, filename = get_master_csv_from_s3()
 
-        # Query Gemini
-        response = await query_gemini(user_query, data_summary)
+        if df is None:
+            raise HTTPException(status_code=500, detail=f"Failed to load {PRIMARY_DATA_FILE}")
+
+        data_context = prepare_data_context(df, filename)
+        response, provider, model = await query_llm(user_query, data_context)
 
         return {
             "query": user_query,
             "response": response,
-            "datasets_available": list(csv_data.keys())
+            "provider": provider,
+            "model": model,
+            "data_file": filename,
+            "data_rows": len(df)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/improvements")
+async def get_improvements():
+    """
+    Suggestions for production improvements.
+    """
+    return {
+        "current_version": "2.0.0",
+        "improvements": [
+            {
+                "category": "Data Accuracy",
+                "suggestions": [
+                    "Implement semantic search (embeddings) for better query understanding",
+                    "Add query validation to ensure user intent matches available data",
+                    "Pre-compute common aggregations (monthly totals, averages) for instant retrieval",
+                    "Add data validation layer to verify LLM responses against actual data"
+                ]
+            },
+            {
+                "category": "Performance",
+                "suggestions": [
+                    "Use Redis for distributed caching instead of in-memory cache",
+                    "Implement async data loading on app startup",
+                    "Add response streaming for faster perceived response times",
+                    "Consider using a vector database (Pinecone, Weaviate) for large datasets"
+                ]
+            },
+            {
+                "category": "Scalability",
+                "suggestions": [
+                    "Add message queue (RabbitMQ/SQS) for async processing",
+                    "Implement rate limiting per user",
+                    "Add horizontal scaling with load balancer",
+                    "Use database (PostgreSQL) for conversation history"
+                ]
+            },
+            {
+                "category": "Monitoring & Observability",
+                "suggestions": [
+                    "Integrate with Datadog/New Relic for APM",
+                    "Set up alerts for error rates and response times",
+                    "Add distributed tracing for end-to-end visibility",
+                    "Implement A/B testing for different prompts"
+                ]
+            },
+            {
+                "category": "Security",
+                "suggestions": [
+                    "Add API authentication for webhook endpoints",
+                    "Implement input sanitization and validation",
+                    "Add PII masking in logs",
+                    "Enable request signing verification for Gupshup"
+                ]
+            },
+            {
+                "category": "User Experience",
+                "suggestions": [
+                    "Add conversation context (remember previous queries)",
+                    "Implement intent classification (data query vs. help request)",
+                    "Add suggested queries based on available data",
+                    "Support data visualization (charts as images)"
+                ]
+            },
+            {
+                "category": "Reliability",
+                "suggestions": [
+                    "Add circuit breaker pattern for external API calls",
+                    "Implement retry logic with exponential backoff",
+                    "Add health checks for all dependencies",
+                    "Set up automated failover to backup LLM providers"
+                ]
+            }
+        ],
+        "priority_actions": [
+            "1. Validate LLM responses against actual data before sending",
+            "2. Add conversation history for context",
+            "3. Pre-compute common metrics for instant accurate responses",
+            "4. Set up proper monitoring and alerting"
+        ]
+    }
 
 
 if __name__ == "__main__":
