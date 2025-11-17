@@ -156,28 +156,45 @@ async def send_whatsapp_message(phone_number: str, message: str):
     """Send WhatsApp message via Gupshup API"""
     if not all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER]):
         print("Gupshup configuration incomplete")
+        print(f"  API Key set: {bool(GUPSHUP_API_KEY)}")
+        print(f"  App Name: {GUPSHUP_APP_NAME}")
+        print(f"  Source Number: {GUPSHUP_SOURCE_NUMBER}")
         return False
 
-    url = "https://api.gupshup.io/sm/api/v1/msg"
+    url = "https://api.gupshup.io/wa/api/v1/msg"
 
     headers = {
         "apikey": GUPSHUP_API_KEY,
-        "Content-Type": "application/x-www-form-urlencoded"
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cache-Control": "no-cache"
     }
+
+    # Ensure phone number is in correct format (no + sign, just digits)
+    clean_phone = phone_number.replace("+", "").replace(" ", "").replace("-", "")
+    clean_source = GUPSHUP_SOURCE_NUMBER.replace("+", "").replace(" ", "").replace("-", "")
 
     data = {
         "channel": "whatsapp",
-        "source": GUPSHUP_SOURCE_NUMBER,
-        "destination": phone_number,
+        "source": clean_source,
+        "destination": clean_phone,
         "message": json.dumps({"type": "text", "text": message}),
         "src.name": GUPSHUP_APP_NAME
     }
 
+    print(f"Sending message to {clean_phone} from {clean_source}")
+    print(f"App name: {GUPSHUP_APP_NAME}")
+    print(f"API Key (first 8 chars): {GUPSHUP_API_KEY[:8]}...")
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, headers=headers, data=data)
+
+            # Log response details for debugging
+            print(f"Response status: {response.status_code}")
+            print(f"Response body: {response.text}")
+
             response.raise_for_status()
-            print(f"Message sent successfully to {phone_number}")
+            print(f"Message sent successfully to {clean_phone}")
             return True
     except Exception as e:
         print(f"Error sending WhatsApp message: {e}")
@@ -202,6 +219,25 @@ async def health_check():
         "s3_configured": s3_client is not None,
         "openrouter_configured": OPENROUTER_API_KEY is not None,
         "gupshup_configured": all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER])
+    }
+
+
+@app.get("/debug/gupshup")
+async def debug_gupshup():
+    """
+    Debug endpoint to verify Gupshup configuration.
+    Shows configuration details (without exposing full API key).
+    """
+    api_key_info = "Not set"
+    if GUPSHUP_API_KEY:
+        api_key_info = f"{GUPSHUP_API_KEY[:8]}...{GUPSHUP_API_KEY[-4:]}" if len(GUPSHUP_API_KEY) > 12 else "Set but too short"
+
+    return {
+        "gupshup_api_key": api_key_info,
+        "gupshup_app_name": GUPSHUP_APP_NAME or "Not set",
+        "gupshup_source_number": GUPSHUP_SOURCE_NUMBER or "Not set",
+        "all_configured": all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER]),
+        "note": "If you're getting 401 errors, verify: 1) API key is correct from Gupshup dashboard, 2) App name matches exactly, 3) Source number is your sandbox/WhatsApp Business number"
     }
 
 
