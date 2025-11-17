@@ -20,9 +20,9 @@ app = FastAPI(
 # Configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-pro-1.5")  # Default to stable model
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")  # Default to current model
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Direct Google Gemini API key
-GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-1.5-flash")  # Default model for direct API
+GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash")  # Default model for direct API (1.5 is retired)
 GUPSHUP_API_KEY = os.getenv("GUPSHUP_API_KEY")
 GUPSHUP_APP_NAME = os.getenv("GUPSHUP_APP_NAME")
 GUPSHUP_SOURCE_NUMBER = os.getenv("GUPSHUP_SOURCE_NUMBER")
