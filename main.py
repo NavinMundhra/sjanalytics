@@ -123,16 +123,19 @@ Please analyze the data and provide a helpful response to the user's query. Form
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://sjanalytics.app",
+        "HTTP-Referer": "https://sjanalytics.railway.app",
         "X-Title": "SJ Analytics WhatsApp Bot"
     }
 
     payload = {
-        "model": "google/gemini-2.0-flash-001",
+        "model": "google/gemini-2.0-flash-exp:free",
         "messages": messages,
         "max_tokens": 1000,
         "temperature": 0.7
     }
+
+    print(f"Calling OpenRouter API with model: {payload['model']}")
+    print(f"API Key (first 8 chars): {OPENROUTER_API_KEY[:8]}...")
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -141,11 +144,18 @@ Please analyze the data and provide a helpful response to the user's query. Form
                 headers=headers,
                 json=payload
             )
+
+            # Log response for debugging
+            print(f"OpenRouter response status: {response.status_code}")
+            if response.status_code != 200:
+                print(f"OpenRouter response body: {response.text}")
+
             response.raise_for_status()
             result = response.json()
             return result['choices'][0]['message']['content']
     except httpx.HTTPStatusError as e:
         print(f"HTTP error from OpenRouter: {e}")
+        print(f"Response body: {e.response.text}")
         return "Sorry, I encountered an error while processing your request. Please try again later."
     except Exception as e:
         print(f"Error querying Gemini: {e}")
