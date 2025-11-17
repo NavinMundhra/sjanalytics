@@ -20,7 +20,9 @@ app = FastAPI(
 # Configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-pro-1.5")  # Default to stable model
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Direct Google Gemini API key
+GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-1.5-flash")  # Default model for direct API
 GUPSHUP_API_KEY = os.getenv("GUPSHUP_API_KEY")
 GUPSHUP_APP_NAME = os.getenv("GUPSHUP_APP_NAME")
 GUPSHUP_SOURCE_NUMBER = os.getenv("GUPSHUP_SOURCE_NUMBER")
@@ -121,7 +123,7 @@ User Query: {user_message}
 Please analyze the data and provide a helpful response to the user's query. Format your response for WhatsApp (keep it concise and easy to read on mobile)."""
 
     # Google Gemini API endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GOOGLE_MODEL}:generateContent?key={GOOGLE_API_KEY}"
 
     payload = {
         "contents": [
@@ -137,7 +139,7 @@ Please analyze the data and provide a helpful response to the user's query. Form
         }
     }
 
-    print(f"Calling Google Gemini API directly...")
+    print(f"Calling Google Gemini API directly with model: {GOOGLE_MODEL}")
     print(f"API Key (first 8 chars): {GOOGLE_API_KEY[:8]}...")
 
     try:
@@ -200,13 +202,13 @@ Please analyze the data and provide a helpful response to the user's query. Form
     }
 
     payload = {
-        "model": "google/gemini-flash-1.5-exp",
+        "model": OPENROUTER_MODEL,
         "messages": messages,
         "max_tokens": 1000,
         "temperature": 0.7
     }
 
-    print(f"Calling OpenRouter API with model: {payload['model']}")
+    print(f"Calling OpenRouter API with model: {OPENROUTER_MODEL}")
     print(f"API Key (first 8 chars): {OPENROUTER_API_KEY[:8]}...")
 
     try:
@@ -230,23 +232,23 @@ Please analyze the data and provide a helpful response to the user's query. Form
 
 
 async def query_gemini(user_message: str, data_context: str) -> str:
-    """Query Google Gemini with fallback: OpenRouter first, then direct Google API"""
+    """Query Google Gemini with fallback: Direct Google API first (more reliable), then OpenRouter"""
 
-    # Try OpenRouter first
-    if OPENROUTER_API_KEY:
-        print("Attempting OpenRouter API...")
-        result = await query_gemini_openrouter(user_message, data_context)
-        if result:
-            return result
-        print("OpenRouter failed, trying direct Google Gemini API...")
-
-    # Fallback to direct Google Gemini API
+    # Try direct Google Gemini API first (more reliable)
     if GOOGLE_API_KEY:
         print("Attempting direct Google Gemini API...")
         result = await query_gemini_direct(user_message, data_context)
         if result:
             return result
-        print("Direct Google Gemini API also failed.")
+        print("Direct Google Gemini API failed, trying OpenRouter...")
+
+    # Fallback to OpenRouter
+    if OPENROUTER_API_KEY:
+        print("Attempting OpenRouter API...")
+        result = await query_gemini_openrouter(user_message, data_context)
+        if result:
+            return result
+        print("OpenRouter also failed.")
 
     # Both failed
     if not OPENROUTER_API_KEY and not GOOGLE_API_KEY:
@@ -343,6 +345,31 @@ async def debug_gupshup():
         "gupshup_source_number": GUPSHUP_SOURCE_NUMBER or "Not set",
         "all_configured": all([GUPSHUP_API_KEY, GUPSHUP_APP_NAME, GUPSHUP_SOURCE_NUMBER]),
         "note": "If you're getting 401 errors, verify: 1) API key is correct from Gupshup dashboard, 2) App name matches exactly, 3) Source number is your sandbox/WhatsApp Business number"
+    }
+
+
+@app.get("/debug/llm")
+async def debug_llm():
+    """
+    Debug endpoint to verify LLM configuration.
+    Shows which models are configured and their current settings.
+    """
+    google_key_info = "Not set"
+    if GOOGLE_API_KEY:
+        google_key_info = f"{GOOGLE_API_KEY[:8]}...{GOOGLE_API_KEY[-4:]}" if len(GOOGLE_API_KEY) > 12 else "Set but too short"
+
+    openrouter_key_info = "Not set"
+    if OPENROUTER_API_KEY:
+        openrouter_key_info = f"{OPENROUTER_API_KEY[:8]}...{OPENROUTER_API_KEY[-4:]}" if len(OPENROUTER_API_KEY) > 12 else "Set but too short"
+
+    return {
+        "google_api_key": google_key_info,
+        "google_model": GOOGLE_MODEL,
+        "openrouter_api_key": openrouter_key_info,
+        "openrouter_model": OPENROUTER_MODEL,
+        "primary_provider": "Google Direct API" if GOOGLE_API_KEY else ("OpenRouter" if OPENROUTER_API_KEY else "None"),
+        "fallback_provider": "OpenRouter" if (GOOGLE_API_KEY and OPENROUTER_API_KEY) else "None",
+        "note": "Direct Google API is tried first (more reliable). Set GOOGLE_API_KEY from https://aistudio.google.com/app/apikey"
     }
 
 
