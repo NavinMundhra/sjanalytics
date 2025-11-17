@@ -92,7 +92,10 @@ def get_data_summary(csv_data: dict) -> str:
         summary += f"File: {file_name}\n"
         summary += f"Columns: {', '.join(df.columns.tolist())}\n"
         summary += f"Rows: {len(df)}\n"
-        summary += f"Sample data (first 3 rows):\n{df.head(3).to_string()}\n\n"
+        # Show first 5 rows for better context
+        summary += f"Sample data (first 5 rows):\n{df.head(5).to_string()}\n\n"
+        # Add column data types for better analysis
+        summary += f"Column types: {df.dtypes.to_string()}\n\n"
 
     return summary
 
@@ -480,8 +483,20 @@ async def gupshup_webhook(request: Request):
         csv_data = get_csv_files_from_s3()
         data_summary = get_data_summary(csv_data)
 
+        # Log data context info
+        print(f"Number of CSV files loaded: {len(csv_data)}")
+        print(f"Data summary length: {len(data_summary)} characters")
+        if len(data_summary) > 500:
+            print(f"Data summary preview (first 500 chars): {data_summary[:500]}...")
+        else:
+            print(f"Data summary: {data_summary}")
+
         # Query Gemini for analysis
         response_message = await query_gemini(user_message, data_summary)
+
+        # Log LLM response
+        print(f"LLM Response length: {len(response_message)} characters")
+        print(f"LLM Response: {response_message[:500]}..." if len(response_message) > 500 else f"LLM Response: {response_message}")
 
         # Send response back via WhatsApp
         await send_whatsapp_message(phone_number, response_message)
